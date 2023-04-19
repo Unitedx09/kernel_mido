@@ -3578,6 +3578,9 @@ static void adreno_iommu_sync(struct kgsl_device *device, bool sync)
 	struct scm_desc desc = {0};
 	int ret;
 
+	if (!ADRENO_QUIRK(ADRENO_DEVICE(device), ADRENO_QUIRK_IOMMU_SYNC))
+		return;
+
 	if (sync == true) {
 		mutex_lock(&kgsl_mmu_sync);
 		desc.args[0] = true;
@@ -3594,25 +3597,29 @@ static void adreno_iommu_sync(struct kgsl_device *device, bool sync)
 	}
 }
 
-static void _regulator_disable(struct kgsl_regulator *regulator, bool poll)
+static void
+_regulator_disable(struct kgsl_regulator *regulator, unsigned int timeout)
 {
-	unsigned long wait_time = jiffies + msecs_to_jiffies(200);
+	unsigned long wait_time;
 
 	if (IS_ERR_OR_NULL(regulator->reg))
 		return;
 
 	regulator_disable(regulator->reg);
 
-	if (poll == false)
-		return;
+	wait_time = jiffies + msecs_to_jiffies(timeout);
 
+	/* Poll for regulator status to ensure it's OFF */
 	while (!time_after(jiffies, wait_time)) {
 		if (!regulator_is_enabled(regulator->reg))
 			return;
-		cpu_relax();
+		usleep_range(10, 100);
 	}
 
-	KGSL_CORE_ERR("regulator '%s' still on after 200ms\n", regulator->name);
+	if (!regulator_is_enabled(regulator->reg))
+		return;
+
+	KGSL_CORE_ERR("regulator '%s' disable timed out\n", regulator->name);
 }
 
 static void adreno_regulator_disable_poll(struct kgsl_device *device)
@@ -3620,18 +3627,13 @@ static void adreno_regulator_disable_poll(struct kgsl_device *device)
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 	struct kgsl_pwrctrl *pwr = &device->pwrctrl;
 	int i;
-
-	/* Fast path - hopefully we don't need this quirk */
-	if (!ADRENO_QUIRK(adreno_dev, ADRENO_QUIRK_IOMMU_SYNC)) {
-		for (i = KGSL_MAX_REGULATORS - 1; i >= 0; i--)
-			_regulator_disable(&pwr->regulators[i], false);
-		return;
-	}
+	unsigned int timeout =
+		ADRENO_QUIRK(adreno_dev, ADRENO_QUIRK_IOMMU_SYNC) ? 200 : 5000;
 
 	adreno_iommu_sync(device, true);
 
-	for (i = 0; i < KGSL_MAX_REGULATORS; i++)
-		_regulator_disable(&pwr->regulators[i], true);
+	for (i = KGSL_MAX_REGULATORS - 1; i >= 0; i--)
+		_regulator_disable(&pwr->regulators[i], timeout);
 
 	adreno_iommu_sync(device, false);
 }
@@ -3753,7 +3755,7 @@ static struct platform_driver kgsl_bus_platform_driver = {
 	}
 };
 
-static int __init kgsl_3d_init(void)
+static int __kgsl_3d_init(void *arg)
 {
 	int ret;
 
@@ -3766,6 +3768,16 @@ static int __init kgsl_3d_init(void)
 		platform_driver_unregister(&kgsl_bus_platform_driver);
 
 	return ret;
+}
+
+static int __init kgsl_3d_init(void)
+{
+	struct task_struct *kgsl_3d_init_task =
+		kthread_run(__kgsl_3d_init, NULL, "kgsl_3d_init");
+	if (IS_ERR(kgsl_3d_init_task))
+		return PTR_ERR(kgsl_3d_init_task);
+	else
+		return 0;
 }
 
 static void __exit kgsl_3d_exit(void)
