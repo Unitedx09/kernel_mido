@@ -42,7 +42,7 @@ static int rome_patch_ver_req(struct hci_dev *hdev, u32 *rome_version)
 
 	cmd = EDL_PATCH_VER_REQ_CMD;
 	skb = __hci_cmd_sync_ev(hdev, EDL_PATCH_CMD_OPCODE, EDL_PATCH_CMD_LEN,
-				&cmd, HCI_VENDOR_PKT, HCI_INIT_TIMEOUT);
+				&cmd, HCI_EV_VENDOR, HCI_INIT_TIMEOUT);
 	if (IS_ERR(skb)) {
 		err = PTR_ERR(skb);
 		BT_ERR("%s: Failed to read version of ROME (%d)", hdev->name,
@@ -84,7 +84,7 @@ static int rome_patch_ver_req(struct hci_dev *hdev, u32 *rome_version)
 	 * and lower 2 bytes from patch will be used.
 	 */
 	*rome_version = (le32_to_cpu(ver->soc_id) << 16) |
-		        (le16_to_cpu(ver->rome_ver) & 0x0000ffff);
+			(le16_to_cpu(ver->rome_ver) & 0x0000ffff);
 
 out:
 	kfree_skb(skb);
@@ -130,28 +130,41 @@ static void rome_tlv_check_data(struct rome_config *config,
 	BT_DBG("TLV Type\t\t : 0x%x", type_len & 0x000000ff);
 	BT_DBG("Length\t\t : %d bytes", length);
 
+	config->dnld_mode = ROME_SKIP_EVT_NONE;
+
 	switch (config->type) {
 	case TLV_TYPE_PATCH:
 		tlv_patch = (struct tlv_type_patch *)tlv->data;
-		BT_DBG("Total Length\t\t : %d bytes",
+
+		/* For Rome version 1.1 to 3.1, all segment commands
+		 * are acked by a vendor specific event (VSE).
+		 * For Rome >= 3.2, the download mode field indicates
+		 * if VSE is skipped by the controller.
+		 * In case VSE is skipped, only the last segment is acked.
+		 */
+		config->dnld_mode = tlv_patch->download_mode;
+
+		BT_DBG("Total Length           : %d bytes",
 		       le32_to_cpu(tlv_patch->total_size));
-		BT_DBG("Patch Data Length\t : %d bytes",
+		BT_DBG("Patch Data Length      : %d bytes",
 		       le32_to_cpu(tlv_patch->data_length));
 		BT_DBG("Signing Format Version : 0x%x",
 		       tlv_patch->format_version);
-		BT_DBG("Signature Algorithm\t : 0x%x",
+		BT_DBG("Signature Algorithm    : 0x%x",
 		       tlv_patch->signature);
-		BT_DBG("Reserved\t\t : 0x%x",
-		       le16_to_cpu(tlv_patch->reserved1));
-		BT_DBG("Product ID\t\t : 0x%04x",
+		BT_DBG("Download mode          : 0x%x",
+		       tlv_patch->download_mode);
+		BT_DBG("Reserved               : 0x%x",
+		       tlv_patch->reserved1);
+		BT_DBG("Product ID             : 0x%04x",
 		       le16_to_cpu(tlv_patch->product_id));
-		BT_DBG("Rom Build Version\t : 0x%04x",
+		BT_DBG("Rom Build Version      : 0x%04x",
 		       le16_to_cpu(tlv_patch->rom_build));
-		BT_DBG("Patch Version\t\t : 0x%04x",
+		BT_DBG("Patch Version          : 0x%04x",
 		       le16_to_cpu(tlv_patch->patch_version));
-		BT_DBG("Reserved\t\t : 0x%x",
+		BT_DBG("Reserved               : 0x%x",
 		       le16_to_cpu(tlv_patch->reserved2));
-		BT_DBG("Patch Entry Address\t : 0x%x",
+		BT_DBG("Patch Entry Address    : 0x%x",
 		       le32_to_cpu(tlv_patch->entry));
 		break;
 
@@ -197,8 +210,8 @@ static void rome_tlv_check_data(struct rome_config *config,
 	}
 }
 
-static int rome_tlv_send_segment(struct hci_dev *hdev, int idx, int seg_size,
-				 const u8 *data)
+static int rome_tlv_send_segment(struct hci_dev *hdev, int seg_size,
+				 const u8 *data, enum rome_tlv_dnld_mode mode)
 {
 	struct sk_buff *skb;
 	struct edl_event_hdr *edl;
@@ -206,14 +219,16 @@ static int rome_tlv_send_segment(struct hci_dev *hdev, int idx, int seg_size,
 	u8 cmd[MAX_SIZE_PER_TLV_SEGMENT + 2];
 	int err = 0;
 
-	BT_DBG("%s: Download segment #%d size %d", hdev->name, idx, seg_size);
-
 	cmd[0] = EDL_PATCH_TLV_REQ_CMD;
 	cmd[1] = seg_size;
 	memcpy(cmd + 2, data, seg_size);
 
+	if (mode == ROME_SKIP_EVT_VSE_CC || mode == ROME_SKIP_EVT_VSE)
+		return __hci_cmd_send(hdev, EDL_PATCH_CMD_OPCODE, seg_size + 2,
+				      cmd);
+
 	skb = __hci_cmd_sync_ev(hdev, EDL_PATCH_CMD_OPCODE, seg_size + 2, cmd,
-				HCI_VENDOR_PKT, HCI_INIT_TIMEOUT);
+				HCI_EV_VENDOR, HCI_INIT_TIMEOUT);
 	if (IS_ERR(skb)) {
 		err = PTR_ERR(skb);
 		BT_ERR("%s: Failed to send TLV segment (%d)", hdev->name, err);
@@ -248,49 +263,14 @@ out:
 	return err;
 }
 
-static int rome_tlv_download_request(struct hci_dev *hdev,
-				     const struct firmware *fw)
-{
-	const u8 *buffer, *data;
-	int total_segment, remain_size;
-	int ret, i;
-
-	if (!fw || !fw->data)
-		return -EINVAL;
-
-	total_segment = fw->size / MAX_SIZE_PER_TLV_SEGMENT;
-	remain_size = fw->size % MAX_SIZE_PER_TLV_SEGMENT;
-
-	BT_DBG("%s: Total segment num %d remain size %d total size %zu",
-	       hdev->name, total_segment, remain_size, fw->size);
-
-	data = fw->data;
-	for (i = 0; i < total_segment; i++) {
-		buffer = data + i * MAX_SIZE_PER_TLV_SEGMENT;
-		ret = rome_tlv_send_segment(hdev, i, MAX_SIZE_PER_TLV_SEGMENT,
-					    buffer);
-		if (ret < 0)
-			return -EIO;
-	}
-
-	if (remain_size) {
-		buffer = data + total_segment * MAX_SIZE_PER_TLV_SEGMENT;
-		ret = rome_tlv_send_segment(hdev, total_segment, remain_size,
-					    buffer);
-		if (ret < 0)
-			return -EIO;
-	}
-
-	return 0;
-}
-
 static int rome_download_firmware(struct hci_dev *hdev,
 				  struct rome_config *config)
 {
 	const struct firmware *fw;
 	u32 type_len, length;
 	struct tlv_type_hdr *tlv;
-	int ret;
+	const u8 *segment;
+	int ret, remain, i = 0;
 
 	BT_INFO("%s: ROME Downloading file: %s", hdev->name, config->fwname);
 	ret = request_firmware(&fw, config->fwname, &hdev->dev);
@@ -337,10 +317,25 @@ static int rome_download_firmware(struct hci_dev *hdev,
 	}
 
 	rome_tlv_check_data(config, fw);
-	ret = rome_tlv_download_request(hdev, fw);
 
-	if (ret) {
-		BT_ERR("Failed to download FW: error = (%d)", ret);
+	segment = fw->data;
+	remain = fw->size;
+	while (remain > 0) {
+		int segsize = min(MAX_SIZE_PER_TLV_SEGMENT, remain);
+
+		bt_dev_dbg(hdev, "Send segment %d, size %d", i++, segsize);
+
+		remain -= segsize;
+		/* The last segment is always acked regardless download mode */
+		if (!remain || segsize < MAX_SIZE_PER_TLV_SEGMENT)
+			config->dnld_mode = ROME_SKIP_EVT_NONE;
+
+		ret = rome_tlv_send_segment(hdev, segsize, segment,
+					    config->dnld_mode);
+		if (ret)
+			break;
+
+		segment += segsize;
 	}
 
 exit:
@@ -360,7 +355,7 @@ int qca_set_bdaddr_rome(struct hci_dev *hdev, const bdaddr_t *bdaddr)
 	cmd[2] = sizeof(bdaddr_t);
 	memcpy(cmd + 3, bdaddr, sizeof(bdaddr_t));
 	skb = __hci_cmd_sync_ev(hdev, EDL_NVM_ACCESS_OPCODE, sizeof(cmd), cmd,
-				HCI_VENDOR_PKT, HCI_INIT_TIMEOUT);
+				HCI_EV_VENDOR, HCI_INIT_TIMEOUT);
 	if (IS_ERR(skb)) {
 		err = PTR_ERR(skb);
 		BT_ERR("%s: Change address command failed (%d)",
@@ -379,6 +374,7 @@ int qca_uart_setup_rome(struct hci_dev *hdev, uint8_t baudrate)
 	u32 rome_ver = 0;
 	struct rome_config config;
 	int err;
+	u8 rom_ver;
 
 	BT_DBG("%s: ROME setup on UART", hdev->name);
 
@@ -395,8 +391,19 @@ int qca_uart_setup_rome(struct hci_dev *hdev, uint8_t baudrate)
 
 	/* Download rampatch file */
 	config.type = TLV_TYPE_PATCH;
-	snprintf(config.fwname, sizeof(config.fwname), "qca/rampatch_%08x.bin",
-		 rome_ver);
+	if (soc_type == QCA_WCN3990) {
+		/* Firmware files to download are based on ROM version.
+		 * ROM version is derived from last two bytes of soc_ver.
+		 */
+		rom_ver = ((soc_ver & 0x00000f00) >> 0x04) |
+			    (soc_ver & 0x0000000f);
+		snprintf(config.fwname, sizeof(config.fwname),
+			 "qca/crbtfw%02x.tlv", rom_ver);
+	} else {
+		snprintf(config.fwname, sizeof(config.fwname),
+			 "qca/rampatch_%08x.bin", soc_ver);
+	}
+
 	err = rome_download_firmware(hdev, &config);
 	if (err < 0) {
 		BT_ERR("%s: Failed to download patch (%d)", hdev->name, err);
@@ -408,8 +415,13 @@ int qca_uart_setup_rome(struct hci_dev *hdev, uint8_t baudrate)
 
 	/* Download NVM configuration */
 	config.type = TLV_TYPE_NVM;
-	snprintf(config.fwname, sizeof(config.fwname), "qca/nvm_%08x.bin",
-		 rome_ver);
+	if (soc_type == QCA_WCN3990)
+		snprintf(config.fwname, sizeof(config.fwname),
+			 "qca/crnv%02x.bin", rom_ver);
+	else
+		snprintf(config.fwname, sizeof(config.fwname),
+			 "qca/nvm_%08x.bin", soc_ver);
+
 	err = rome_download_firmware(hdev, &config);
 	if (err < 0) {
 		BT_ERR("%s: Failed to download NVM (%d)", hdev->name, err);

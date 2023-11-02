@@ -85,7 +85,7 @@ static void __exit_signal(struct task_struct *tsk)
 	struct signal_struct *sig = tsk->signal;
 	bool group_dead = thread_group_leader(tsk);
 	struct sighand_struct *sighand;
-	struct tty_struct *uninitialized_var(tty);
+	struct tty_struct *tty;
 	cputime_t utime, stime;
 
 	sighand = rcu_dereference_check(tsk->sighand,
@@ -835,6 +835,10 @@ void do_exit(long code)
 
 	sched_exit(tsk);
 	schedtune_exit_task(tsk);
+
+	if (tsk->flags & PF_SU) {
+		su_exit();
+	}
 
 	/* sync mm's RSS info before statistics gathering */
 	if (tsk->mm)

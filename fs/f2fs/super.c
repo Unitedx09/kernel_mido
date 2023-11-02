@@ -1264,8 +1264,7 @@ static int f2fs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	}
 
 	buf->f_namelen = F2FS_NAME_LEN;
-	buf->f_fsid.val[0] = (u32)id;
-	buf->f_fsid.val[1] = (u32)(id >> 32);
+	buf->f_fsid    = u64_to_fsid(id);
 
 #ifdef CONFIG_QUOTA
 	if (is_inode_flag_set(dentry->d_inode, FI_PROJ_INHERIT) &&
@@ -3556,6 +3555,8 @@ free_stats:
 	f2fs_gc_sbi_list_del(sbi);
 	f2fs_destroy_stats(sbi);
 free_nm:
+	/* stop discard thread before destroying node manager */
+	f2fs_stop_discard_thread(sbi);
 	f2fs_destroy_node_manager(sbi);
 free_sm:
 	f2fs_destroy_segment_manager(sbi);
